@@ -1,4 +1,4 @@
-/*
+/* version 1.1.1
        __  ___     __ __    ___  _
       /  |/  /__ _/ //_/__ / _ \(_)___
      / /|_/ / _ `/ ,< / -_) // / / __/
@@ -6,11 +6,8 @@
 
 */
 
-import math._
-import scala.util._
 import scala.io.StdIn._
-import java.lang.String
-import scala.collection.mutable.ListBuffer
+import scala.math._
 
 // =========================== TYPES
 object Types {
@@ -21,12 +18,24 @@ object Types {
 }
 import Types._
 
+// ========================== Math
+object MyMaths {
+  def distanceEntrePosition(p1: Position, p2: Position): Double =
+    sqrt(pow(p1._1 - p2._1, 2) + pow(p1._2 - p2._2, 2))
+}
+import MyMaths._
+
+object Debug {
+  def debugln(message: String): Unit = Console.err.println(message)
+}
+import Debug._
+
 object Player extends App {
 
   val Array(width, height) = (readLine split " ").filter(_ != "").map (_.toInt)
 
   (0 until 200)
-    .foldLeft(InfoGlobal())((acc, current) => {
+    .foldLeft(InfoGlobal())((acc, _) => {
 
       // myScore: Amount of ore delivered
       val Array(myScore, opponentScore) = (readLine split " ").filter(_ != "").map (_.toInt)
@@ -42,7 +51,6 @@ object Player extends App {
         })
 
 
-
       val Array(entityCount, radarCooldown, trapCooldown) = (readLine split " ").filter(_ != "").map (_.toInt)
 
       val entities: List[Entity] = (0 until entityCount).toList
@@ -55,7 +63,7 @@ object Player extends App {
       val mapWithElements = emptyMap ++ (entities.groupBy(e => e.entityType))
 
 
-      val (radars :: robots :: traps :: Nil) = mapWithElements
+      val radars :: robots :: traps :: Nil = mapWithElements
         .toList
         .sortBy(_._1) // sort par ordre alphabétique ce qui garantit l'ordre suivant -> radars, robots, traps
         .map(_._2) // on recupère uniquement les listes de nos entités
@@ -63,18 +71,29 @@ object Player extends App {
       val gameMap = GameMap(width, height, tileMap, getRadars(radars))
 
       val mineRobots = Role.dispatcher(getMines(robots))
+      val newEnemiesPosition: List[Position] = getEnemies(robots)
+        .map(enemy => (enemy.x, enemy.y))
 
-      Console.err.println(s"radars : ${radars}")
-      Console.err.println(s"robots : ${robots}")
-      Console.err.println(s"traps  : ${traps}")
-      Console.err.println(s"mines  : ${mineRobots}")
+      debugln(s"radars : ${radars}")
+      debugln(s"robots : ${robots}")
+      debugln(s"traps  : ${traps}")
+      debugln(s"mines  : ${mineRobots}")
 
       // instructions
       val infoGlobalesUpdated = mineRobots
         .foldLeft(acc)((infoAcc, currentRobot) => {
+          val lastEnemiesPositions: List[Position] = infoAcc.enemiesPositions
+          val newBombePositions = updateBlackList(infoAcc.blackList, lastEnemiesPositions, newEnemiesPosition)
+
+
+
           val nAcc = currentRobot.role.action(currentRobot, gameMap, infoAcc)
-          Console.err.println(s"old infos ------ $infoAcc")
-          Console.err.println(s"new infos ------ $nAcc")
+            .copy(
+              enemiesPositions = newEnemiesPosition,
+              blackList = newBombePositions
+            )
+          debugln(s"old infos ------ $infoAcc")
+          debugln(s"new infos ------ $nAcc")
           nAcc
         })
       infoGlobalesUpdated
@@ -84,8 +103,30 @@ object Player extends App {
     .map(_.asInstanceOf[Robot])
     .filter(_.mine)
 
+  def getEnemies(robots: List[Entity]): List[Robot] = robots
+    .map(_.asInstanceOf[Robot])
+    .filter(!_.mine)
+
   def getRadars(radars: List[Entity]): List[Radar] = radars
     .map(_.asInstanceOf[Radar])
+
+  /**
+   * Retourne les positions des bombes potentielles
+   */
+  def updateBlackList(bombePotentielles: List[Position], oldPositions: List[Position], newPositions: List[Position]): List[Position] = {
+    val nouvelleBombes = oldPositions
+      .intersect(newPositions)
+      .flatMap(current => {
+        val x = current._1
+        val y = current._2
+        // List((x, y - 1), (x + 1, y), (x, y + 1), (x - 1, y))
+        List((x + 1, y))
+      })
+      .distinct
+
+    (bombePotentielles ++ nouvelleBombes)
+      .distinct // on supprime les doublons dans le but de ne pas surcharger
+  }
 }
 
 // region entity
@@ -181,7 +222,7 @@ case object Mineur extends Role {
       val targetOpt = infoGlobal.oreTargets.getTarget(currentRobot)
       targetOpt match {
         case Some(target) => {
-          if (mineraiPositions.exists(_ == target)) {
+          if (mineraiPositions.contains(target)) {
             // il y a encore du minerai on ne fait rien
             infoGlobal
           } else {
@@ -202,8 +243,13 @@ case object Mineur extends Role {
     val mineraiPositions = gameMap.getOrePositions
     val mineraiNonMarques = mineraiPositions
       .filter(position => infoGlobal.oreTargets.canMark(currentRobot, position))
+      .sortBy(position => distanceEntrePosition(position, (currentRobot.x, currentRobot.y))) // on met la plus petite distance en prioritée
+
+    // on filtre par rapport à notre black list
+    val mineraiNonMarqueAndSafe = mineraiNonMarques.diff(infoGlobal.blackList)
+
     // on marque la position
-    val targetPositionOpt = mineraiNonMarques.headOption
+    val targetPositionOpt = mineraiNonMarqueAndSafe.headOption
     targetPositionOpt match {
       case Some(targetPosition) => {
         // on trouve un position a cible => on met a jour infoGlobal avec la nouvelle target
@@ -294,11 +340,13 @@ case class RobotsTargets(targets: Map[RobotId, Position]) {
 
 // region shared loop data
 
-case class InfoGlobal(oreTargets: RobotsTargets, wardPositions: List[Position]) {
+// on a besoin sauvegarder l'ancienne position des ennemis dans le bus de savoir s'ils on creusé ou non
 
-}
+case class InfoGlobal(oreTargets: RobotsTargets, wardPositions: List[Position], enemiesPositions: List[Position], blackList: List[Position])
 object InfoGlobal {
-  val wards = List((5, 11), (10, 7), (16, 8), (18, 4), (20, 8))
-  def apply(): InfoGlobal = new InfoGlobal(RobotsTargets(Map.empty[RobotId, Position]), wards)
+  val wards = List((5, 11), (10, 7), (16, 8), (18, 4), (20, 8), (23, 4), (24, 10))
+
+
+  def apply(): InfoGlobal = new InfoGlobal(RobotsTargets(Map.empty[RobotId, Position]), wards, List.empty[Position], List.empty[Position])
 }
 // endregion
